@@ -18,13 +18,47 @@ app.use((req, _res, next) => {
   next();
 });
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: Number(process.env.DB_PORT || 5432),
-});
+const isRenderDatabaseUrl = Boolean(process.env.DATABASE_URL);
+
+const pool = isRenderDatabaseUrl
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : new Pool({
+      host: process.env.DB_HOST,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+      port: Number(process.env.DB_PORT || 5432),
+    });
+
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS failures (
+        id SERIAL PRIMARY KEY,
+        machine TEXT,
+        product TEXT,
+        problem TEXT,
+        cause TEXT,
+        solution TEXT,
+        operator TEXT,
+        maintenance TEXT,
+        tempo_perdido_min INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'aberta',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        resolved_shift TEXT,
+        resolved_at TIMESTAMP,
+        resolved_by_role TEXT
+      );
+    `);
+
+    console.log("✅ Banco pronto");
+  } catch (err) {
+    console.error("❌ Erro ao criar banco:", err);
+  }
+}
 
 const shiftLabels = ["1º turno", "2º turno", "3º turno"];
 
@@ -128,12 +162,23 @@ function authenticate(req, res, next) {
   next();
 }
 
-function requireManagerOrIT(req, res, next) {
+function requireResolvePermission(req, res, next) {
   const role = normalizeRole(req.user?.role);
   console.log("ROLE RECEBIDO:", role);
 
   if (!["operador", "gestor", "ti"].includes(role)) {
     return res.status(403).json({ erro: "Sem permissão para esta ação." });
+  }
+
+  next();
+}
+
+function requireDeletePermission(req, res, next) {
+  const role = normalizeRole(req.user?.role);
+  console.log("ROLE RECEBIDO:", role);
+
+  if (!["gestor", "ti"].includes(role)) {
+    return res.status(403).json({ erro: "Sem permissão para excluir registros." });
   }
 
   next();
@@ -204,7 +249,7 @@ app.get("/failures", authenticate, async (_req, res) => {
     res.json(result.rows);
   } catch (error) {
     console.error("Erro no GET /failures:", error);
-    res.status(500).json({ erro: error.message });
+    res.status(500).json({ erro: error.message || "Erro ao buscar falhas." });
   }
 });
 
@@ -255,11 +300,11 @@ app.post("/failures", authenticate, async (req, res) => {
     res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error("Erro no POST /failures:", error);
-    res.status(500).json({ erro: error.message });
+    res.status(500).json({ erro: error.message || "Erro ao salvar falha." });
   }
 });
 
-app.put("/failures/:id/resolve", authenticate, requireManagerOrIT, async (req, res) => {
+app.put("/failures/:id/resolve", authenticate, requireResolvePermission, async (req, res) => {
   try {
     const { id } = req.params;
     const shift = String(req.body?.shift || "").trim();
@@ -300,7 +345,7 @@ app.put("/failures/:id/resolve", authenticate, requireManagerOrIT, async (req, r
     res.json(result.rows[0]);
   } catch (error) {
     console.error("Erro no PUT /failures/:id/resolve:", error);
-    res.status(500).json({ erro: error.message });
+    res.status(500).json({ erro: error.message || "Erro ao resolver falha." });
   }
 });
 
@@ -429,20 +474,21 @@ app.get("/failures/insights", authenticate, async (req, res) => {
   }
 });
 
-app.delete("/failures/:id", authenticate, requireManagerOrIT, async (req, res) => {
+app.delete("/failures/:id", authenticate, requireDeletePermission, async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query("DELETE FROM failures WHERE id = $1", [id]);
     res.json({ success: true });
   } catch (error) {
     console.error("Erro no DELETE /failures/:id:", error);
-    res.status(500).json({ erro: error.message });
+    res.status(500).json({ erro: error.message || "Erro ao excluir falha." });
   }
 });
 
 const port = Number(process.env.APP_PORT || 3000);
 
-app.listen(port, "0.0.0.0", () => {
+app.listen(port, "0.0.0.0", async () => {
   console.log(`Servidor rodando na porta ${port}`);
   console.log("Servidor acessível na rede local.");
+  await initDatabase();
 });
