@@ -54,6 +54,58 @@ async function initDatabase() {
       );
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS machines (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT DEFAULT 'Cadastrada',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS machines_name_unique_idx
+      ON machines (LOWER(name));
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        machine TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS products_name_machine_unique_idx
+      ON products (LOWER(name), COALESCE(LOWER(machine), ''));
+    `);
+
+    for (const machine of defaultMachines) {
+      await upsertMachine(machine.name, machine.category);
+    }
+
+    for (const product of defaultProducts) {
+      await upsertProduct(product.name, product.machine);
+    }
+
+    await pool.query(`
+      INSERT INTO machines (name, category)
+      SELECT DISTINCT TRIM(machine), 'Histórico'
+      FROM failures
+      WHERE TRIM(COALESCE(machine, '')) <> ''
+      ON CONFLICT (LOWER(name)) DO NOTHING;
+    `);
+
+    await pool.query(`
+      INSERT INTO products (name, machine)
+      SELECT DISTINCT TRIM(product), NULLIF(TRIM(machine), '')
+      FROM failures
+      WHERE TRIM(COALESCE(product, '')) <> ''
+      ON CONFLICT (LOWER(name), COALESCE(LOWER(machine), '')) DO NOTHING;
+    `);
+
     console.log("✅ Banco pronto");
   } catch (err) {
     console.error("❌ Erro ao criar banco:", err);
@@ -61,6 +113,98 @@ async function initDatabase() {
 }
 
 const shiftLabels = ["1º turno", "2º turno", "3º turno"];
+
+const defaultMachines = [
+  { name: "Noack 920", category: "Primária" },
+  { name: "IMA 1", category: "Primária" },
+  { name: "IMA 2", category: "Primária" },
+  { name: "Bolsar 1", category: "Primária" },
+  { name: "Bolsar 2", category: "Primária" },
+  { name: "Ulmhann", category: "Primária" },
+  { name: "Cartopac", category: "Secundária" },
+  { name: "IMA 1 Encartuchadeira", category: "Secundária" },
+  { name: "IMA 2 Encartuchadeira", category: "Secundária" },
+  { name: "Uhlmann encartuchadeira", category: "Secundária" },
+  { name: "Verttopac", category: "Secundária" },
+];
+
+const defaultProducts = [
+  { name: "Ciprofibrato 100mg x30", machine: "IMA 1" },
+  { name: "Carvedilol 100mg x30", machine: "IMA 1" },
+  { name: "Pantogar", machine: "IMA 1" },
+  { name: "Gabapentina 100mg x30", machine: "IMA 2" },
+  { name: "E-casil 15mg x30", machine: "IMA 2" },
+  { name: "Vasopril 15mg x30", machine: "IMA 2" },
+  { name: "Remédio 1", machine: "Ulmhann" },
+  { name: "Remédio 2", machine: "Ulmhann" },
+  { name: "Remédio 3", machine: "Ulmhann" },
+];
+
+function normalizeText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const synonymGroups = [
+  ["leitura", "sensor", "scanner", "pharmacode", "codigo", "camera", "visao", "reader"],
+  ["travamento", "travou", "bloqueio", "parada", "agarrou", "enrosco", "emperrou"],
+  ["cartucho", "cartucheira", "encartuchadeira", "caixa"],
+  ["blister", "deposito", "magazine", "alinhamento"],
+  ["cola", "nordson", "bico", "hotmelt", "problue"],
+  ["solda", "selagem", "temperatura", "aluminio", "pvc"],
+  ["datador", "impressao", "lote", "validade", "carimbo"],
+  ["sensor", "fotocelula", "sinal", "detector"],
+];
+
+function expandKeywords(value) {
+  const tokens = new Set(normalizeText(value).split(" ").filter((word) => word.length >= 3));
+  for (const group of synonymGroups) {
+    if (group.some((term) => tokens.has(term))) {
+      group.forEach((term) => tokens.add(term));
+    }
+  }
+  return tokens;
+}
+
+function textIncludesAny(text, tokens) {
+  const normalized = normalizeText(text);
+  for (const token of tokens) {
+    if (token.length >= 3 && normalized.includes(token)) return true;
+  }
+  return false;
+}
+
+async function upsertMachine(name, category = "Cadastrada") {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return null;
+  const result = await pool.query(
+    `INSERT INTO machines (name, category)
+     VALUES ($1, $2)
+     ON CONFLICT (LOWER(name)) DO UPDATE SET category = COALESCE(EXCLUDED.category, machines.category)
+     RETURNING id, name, category`,
+    [cleanName, category || "Cadastrada"]
+  );
+  return result.rows[0];
+}
+
+async function upsertProduct(name, machine = null) {
+  const cleanName = String(name || "").trim();
+  const cleanMachine = String(machine || "").trim() || null;
+  if (!cleanName) return null;
+  const result = await pool.query(
+    `INSERT INTO products (name, machine)
+     VALUES ($1, $2)
+     ON CONFLICT (LOWER(name), COALESCE(LOWER(machine), '')) DO UPDATE SET machine = EXCLUDED.machine
+     RETURNING id, name, machine`,
+    [cleanName, cleanMachine]
+  );
+  return result.rows[0];
+}
 
 function getRoleCredentials() {
   return [
@@ -224,6 +368,70 @@ app.post("/auth/login", (req, res) => {
   });
 });
 
+
+app.get("/machines", authenticate, async (_req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name AS nome, category AS categoria
+       FROM machines
+       ORDER BY CASE category WHEN 'Primária' THEN 1 WHEN 'Secundária' THEN 2 ELSE 3 END, name ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Erro no GET /machines:", error);
+    res.status(500).json({ erro: error.message || "Erro ao buscar máquinas." });
+  }
+});
+
+app.post("/machines", authenticate, async (req, res) => {
+  try {
+    const name = String(req.body?.nome || req.body?.name || "").trim();
+    const category = String(req.body?.categoria || req.body?.category || "Cadastrada").trim() || "Cadastrada";
+    if (!name) return res.status(400).json({ erro: "Nome da máquina é obrigatório." });
+    const item = await upsertMachine(name, category);
+    res.status(201).json({ id: item.id, nome: item.name, categoria: item.category });
+  } catch (error) {
+    console.error("Erro no POST /machines:", error);
+    res.status(500).json({ erro: error.message || "Erro ao cadastrar máquina." });
+  }
+});
+
+app.get("/products", authenticate, async (req, res) => {
+  try {
+    const machine = String(req.query.machine || "").trim();
+    const values = [];
+    let where = "";
+    if (machine) {
+      values.push(machine);
+      where = "WHERE machine = $1 OR machine IS NULL";
+    }
+    const result = await pool.query(
+      `SELECT id, name AS nome, machine AS maquina
+       FROM products
+       ${where}
+       ORDER BY name ASC`,
+      values
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error("Erro no GET /products:", error);
+    res.status(500).json({ erro: error.message || "Erro ao buscar produtos." });
+  }
+});
+
+app.post("/products", authenticate, async (req, res) => {
+  try {
+    const name = String(req.body?.nome || req.body?.name || "").trim();
+    const machine = String(req.body?.maquina || req.body?.machine || "").trim();
+    if (!name) return res.status(400).json({ erro: "Nome do produto é obrigatório." });
+    const item = await upsertProduct(name, machine || null);
+    res.status(201).json({ id: item.id, nome: item.name, maquina: item.machine });
+  } catch (error) {
+    console.error("Erro no POST /products:", error);
+    res.status(500).json({ erro: error.message || "Erro ao cadastrar produto." });
+  }
+});
+
 app.get("/failures", authenticate, async (_req, res) => {
   try {
     const result = await pool.query(
@@ -265,6 +473,9 @@ app.post("/failures", authenticate, async (req, res) => {
       manutencao,
       tempoPerdidoMin,
     } = req.body;
+
+    await upsertMachine(maquina, "Cadastrada");
+    await upsertProduct(produto, maquina);
 
     const result = await pool.query(
       `INSERT INTO failures
@@ -356,13 +567,23 @@ app.get("/failures/similar", authenticate, async (req, res) => {
     const problem = String(req.query.problem || "").trim();
     const cause = String(req.query.cause || "").trim();
 
-    if (!product || (!problem && !cause)) {
+    const normMachine = normalizeText(machine);
+    const normProduct = normalizeText(product);
+    const normProblem = normalizeText(problem);
+    const normCause = normalizeText(cause);
+
+    // Não pesquisar só por produto/máquina. Isso gerava sugestão para quase tudo.
+    // Exige uma pista técnica mínima: problema ou causa com texto útil.
+    if (normProblem.length < 5 && normCause.length < 5) {
       return res.json([]);
     }
 
-    const productLike = `%${product}%`;
-    const problemLike = `%${problem}%`;
-    const causeLike = `%${cause}%`;
+    const queryTokens = [...expandKeywords(`${problem} ${cause}`)]
+      .filter((token) => token.length >= 4 && !["falha", "erro", "problema", "maquina", "produto"].includes(token));
+
+    if (queryTokens.length === 0 && normProblem.length < 8 && normCause.length < 8) {
+      return res.json([]);
+    }
 
     const result = await pool.query(
       `SELECT
@@ -379,25 +600,55 @@ app.get("/failures/similar", authenticate, async (req, res) => {
          COALESCE(status, 'aberta') AS status,
          resolved_shift AS "turnoResolvido",
          resolved_at AS "resolvidoEm",
-         resolved_by_role AS "resolvidoPorPerfil",
-         (
-           CASE WHEN machine <> $1 THEN 2 ELSE 0 END +
-           CASE WHEN problem ILIKE $3 THEN 3 ELSE 0 END +
-           CASE WHEN cause <> '' AND cause ILIKE $4 THEN 2 ELSE 0 END +
-           CASE WHEN COALESCE(status, 'aberta') = 'resolvida' THEN 1 ELSE 0 END
-         ) AS score
+         resolved_by_role AS "resolvidoPorPerfil"
        FROM failures
-       WHERE product ILIKE $2
-         AND (
-           ($3 <> '%%' AND problem ILIKE $3)
-           OR ($4 <> '%%' AND cause ILIKE $4)
-         )
-       ORDER BY score DESC, created_at DESC
-       LIMIT 5`,
-      [machine, productLike, problemLike, causeLike]
+       WHERE COALESCE(solution, '') <> ''
+       ORDER BY created_at DESC
+       LIMIT 300`
     );
 
-    res.json(result.rows);
+    const scored = result.rows
+      .map((row) => {
+        let score = 0;
+        let technicalHits = 0;
+
+        const rowMachine = normalizeText(row.maquina);
+        const rowProduct = normalizeText(row.produto);
+        const rowProblem = normalizeText(row.problema);
+        const rowCause = normalizeText(row.causa);
+        const rowSolution = normalizeText(row.solucao);
+
+        if (normProblem.length >= 5 && (rowProblem.includes(normProblem) || normProblem.includes(rowProblem))) {
+          score += 10;
+          technicalHits += 2;
+        }
+
+        if (normCause.length >= 5 && (rowCause.includes(normCause) || normCause.includes(rowCause))) {
+          score += 7;
+          technicalHits += 2;
+        }
+
+        for (const token of queryTokens) {
+          let hit = false;
+          if (rowProblem.includes(token)) { score += 4; hit = true; }
+          if (rowCause.includes(token)) { score += 3; hit = true; }
+          if (rowSolution.includes(token)) { score += 2; hit = true; }
+          if (hit) technicalHits += 1;
+        }
+
+        // Máquina e produto apenas refinam o ranking. Não autorizam sugestão sozinhos.
+        if (normMachine && rowMachine === normMachine) score += 2;
+        if (normProduct && rowProduct && (rowProduct.includes(normProduct) || normProduct.includes(rowProduct))) score += 2;
+        if (row.status === "resolvida") score += 2;
+
+        return { ...row, score, technicalHits };
+      })
+      .filter((row) => row.technicalHits >= 1 && row.score >= 7)
+      .sort((a, b) => b.score - a.score || new Date(b.dataHora).getTime() - new Date(a.dataHora).getTime())
+      .slice(0, 5)
+      .map(({ technicalHits, ...row }) => row);
+
+    res.json(scored);
   } catch (error) {
     console.error("Erro no GET /failures/similar:", error);
     res.status(500).json({ erro: error.message || "Erro ao buscar soluções semelhantes." });
